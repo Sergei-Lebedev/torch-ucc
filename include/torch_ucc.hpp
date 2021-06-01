@@ -70,14 +70,14 @@ namespace c10d {
     (_ucp_tag_mask) = (uint64_t)-1;                                \
   } while (0)
 
-enum torch_ucx_tag_type_t { TORCH_UCX_P2P_TAG, TORCH_UCX_OOB_TAG };
-
 struct event_pool_t {
 #ifdef USE_CUDA
   std::queue<std::unique_ptr<at::cuda::CUDAEvent>> event_pool;
 #endif
   std::mutex event_pool_mutex;
 };
+
+ucc_status_t torch_ucx_alltoall_finalize(void *request);
 
 class CommPG;
 
@@ -124,6 +124,7 @@ class ProcessGroupUCC : public ProcessGroup {
         ucc_ee_h ee,
         CommBase* comm)
         : ProcessGroup::Work(-1, opType),
+          iscoll(false),
           status_(status),
           request_(request),
           comm_(comm) {}
@@ -137,6 +138,7 @@ class ProcessGroupUCC : public ProcessGroup {
     std::unique_ptr<at::cuda::CUDAEvent> fence = nullptr;
     event_pool_t* ep = nullptr;
 #endif
+    bool iscoll;
    protected:
     ucc_status_t status_;
     ucc_coll_req_h request_;
@@ -243,6 +245,7 @@ class ProcessGroupUCC : public ProcessGroup {
   }
 
  protected:
+  int tag;
   torch_ucc_oob_coll_info_t oob;
   std::shared_ptr<CommPG> comm;
   uint32_t comm_id;
@@ -291,6 +294,10 @@ class CommPG {
       OpType opType,
       ucc_coll_req_h request);
 
+  c10::intrusive_ptr<ProcessGroup::Work> enqueue_p2p_coll(
+      OpType opType,
+      ucc_coll_req_h request);
+
 #ifdef USE_CUDA
   c10::intrusive_ptr<ProcessGroupUCC::WorkUCC> enqueue_cuda_collective(
       OpType opType,
@@ -329,6 +336,26 @@ class CommPG {
       size_t size,
       ucp_tag_t ucp_tag,
       ucp_tag_t ucp_tag_mask);
+};
+
+struct torch_ucx_coll_request_t {
+  ucc_status_t status;
+  int grank;
+  int gsize;
+  uint32_t tag;
+  int chunk;
+  size_t len;
+
+  void* src_buffer;
+  ucs_memory_type_t src_mtype;
+  void* dst_buffer;
+  ucs_memory_type_t dst_mtype;
+
+  int n_sreqs;
+  int n_rreqs;
+  std::vector<ucp_ep_h> eps;
+  std::shared_ptr<CommPG> comm;
+  ucc_coll_req_h *reqs;
 };
 
 } // namespace c10d

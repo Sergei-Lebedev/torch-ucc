@@ -53,12 +53,15 @@ const std::map<ReduceOp, ucc_reduction_op_t> ucc_op_map = {
 struct torch_ucc_config_t {
   std::once_flag flag;
   std::array<bool, 32> blocking_wait;
+  int chunk;
 } torch_ucc_config;
 
 void read_confg() {
   char* env;
 
   torch_ucc_config.blocking_wait.fill(true);
+  torch_ucc_config.chunk = 1;
+
   env = std::getenv("TORCH_UCC_ALLGATHER_BLOCKING_WAIT");
   if (env) {
     torch_ucc_config.blocking_wait[(std::uint8_t)OpType::ALLGATHER] =
@@ -78,6 +81,10 @@ void read_confg() {
   if (env) {
     torch_ucc_config.blocking_wait[(std::uint8_t)OpType::BROADCAST] =
         std::atoi(env);
+  }
+  env = std::getenv("TORCH_UCX_ALLTOALL_CHUNK");
+  if (env) {
+    torch_ucc_config.chunk = std::atoi(env);
   }
 }
 
@@ -135,7 +142,9 @@ bool ProcessGroupUCC::WorkUCC::wait(std::chrono::milliseconds /* unused */) {
 
 void ProcessGroupUCC::WorkUCC::finalize() {
   if (request_ != nullptr) {
-    if (isP2POp(opType_)) {
+    if (iscoll) {
+      torch_ucx_alltoall_finalize(request_);
+    } else if (isP2POp(opType_)) {
       request_->status = UCC_INPROGRESS;
       ucp_request_free(request_);
     } else {
@@ -145,6 +154,7 @@ void ProcessGroupUCC::WorkUCC::finalize() {
     request_ = nullptr;
   }
 }
+
 
 CommPG::CommPG(torch_ucc_oob_coll_info_t* oob_info,
     c10::Device dev)
@@ -363,6 +373,19 @@ c10::intrusive_ptr<ProcessGroup::Work> CommPG::enqueue_p2p(
   return work;
 }
 
+c10::intrusive_ptr<ProcessGroup::Work> CommPG::enqueue_p2p_coll(
+    OpType opType,
+    ucc_coll_req_h request) {
+  auto work = c10::make_intrusive<ProcessGroupUCC::WorkUCC>(
+      opType, UCC_INPROGRESS, request, nullptr, &ucx_comm);
+  std::unique_lock<std::mutex> lock(mutex);
+  work->iscoll = true;
+  progress_queue.push_back(work);
+  lock.unlock();
+  queue_produce_cv.notify_one();
+  return work;
+}
+
 c10::intrusive_ptr<ProcessGroupUCC::WorkUCC> CommPG::enqueue_collective(
     OpType opType,
     ucc_coll_args_t& coll,
@@ -435,6 +458,181 @@ c10::intrusive_ptr<ProcessGroupUCC::WorkUCC> CommPG::enqueue_cuda_collective(
 }
 #endif
 
+static inline int get_recv_peer(int grank,int gsize, int step) {
+    return (grank + 1 + step) % gsize;
+}
+
+static inline int get_send_peer(int grank, int gsize, int step) {
+    return (grank - 1 - step + gsize) % gsize;
+}
+
+#define COMMCOLLID 2
+ucc_status_t torch_ucx_alltoall_finalize(void *request) {
+  torch_ucx_coll_request_t *req = (torch_ucx_coll_request_t*)request;
+
+  delete[] req->reqs;
+  delete req;
+
+  return UCC_OK;
+}
+
+ucc_status_t torch_ucx_alltoall_progress(torch_ucx_coll_request_t* request)
+{
+  const int max_polls = 20;
+  int gsize = request->gsize;
+  int grank = request->grank;
+  int chunk = request->chunk;
+  int n_polls = 0;
+  ptrdiff_t sbuf = (ptrdiff_t)request->src_buffer;
+  ptrdiff_t rbuf = (ptrdiff_t)request->dst_buffer;
+  size_t data_size = request->len;
+  bool done;
+  int slot;
+
+  while ((n_polls++ < max_polls) &&
+         ((request->n_sreqs != gsize) || (request->n_rreqs != gsize))) {
+    ucp_tag_t ucp_tag, ucp_tag_mask;
+    int peer;
+
+    if (request->n_rreqs < gsize) {
+      done = false;
+      for (slot = 0; slot < chunk; slot++) {
+        if (request->reqs[slot] == nullptr) {
+          done = true;
+          break;
+        } else if (request->reqs[slot]->status == UCC_OK) {
+          request->reqs[slot]->status = UCC_INPROGRESS;
+          ucp_request_free(request->reqs[slot]);
+          request->reqs[slot] = nullptr;
+          done = true;
+          break;
+        }
+      }
+      if (done) {
+        peer = get_recv_peer(grank, gsize, request->n_rreqs);
+        TORCH_UCX_MAKE_RECV_TAG(ucp_tag, ucp_tag_mask, request->tag, peer,
+                                COMMCOLLID);
+        request->reqs[slot] = request->comm->recv_nb(
+            (void*)(rbuf + peer * data_size),
+            request->dst_mtype,
+            data_size,
+            ucp_tag,
+            ucp_tag_mask);
+        request->n_rreqs++;
+        n_polls = 0;
+      }
+    }
+
+    if (request->n_sreqs < gsize) {
+      done = false;
+      for (slot = chunk; slot < 2*chunk; slot++) {
+        if (request->reqs[slot] == nullptr) {
+          done = true;
+          break;
+        } else if (request->reqs[slot]->status == UCC_OK) {
+          request->reqs[slot]->status = UCC_INPROGRESS;
+          ucp_request_free(request->reqs[slot]);
+          request->reqs[slot] = nullptr;
+          done = true;
+          break;
+        }
+      }
+      if (done) {
+        peer = get_send_peer(grank, gsize, request->n_sreqs);
+        TORCH_UCX_MAKE_SEND_TAG(ucp_tag, request->tag, grank, COMMCOLLID);
+        request->reqs[slot] = request->comm->send_nb(
+            request->eps[peer],
+            (void*)(sbuf + peer * data_size),
+            request->src_mtype,
+            data_size,
+            ucp_tag);
+        request->n_sreqs++;
+        n_polls = 0;
+      }
+    }
+  }
+
+  if ((request->n_sreqs != gsize) || (request->n_rreqs != gsize)) {
+    return UCC_OK;
+  }
+
+  int num_done = 0;
+  for (slot = 0; slot < 2*chunk; slot++) {
+    if (request->reqs[slot] == nullptr) {
+      num_done += 1;
+    } else if (request->reqs[slot]->status == UCC_OK) {
+      num_done += 1;
+      request->reqs[slot]->status = UCC_INPROGRESS;
+      ucp_request_free(request->reqs[slot]);
+      request->reqs[slot] = nullptr;
+    }
+  }
+  if (num_done == 2*chunk) {
+    request->status = UCC_OK;
+  }
+  return UCC_OK;
+}
+
+ucc_status_t torch_ucx_alltoall(int gsize, int grank, uint32_t tag,
+                                at::Tensor& input_tensor,
+                                at::Tensor& output_tensor,
+                                int chunk,
+                                std::shared_ptr<CommPG> comm,
+                                std::vector<ucp_ep_h> eps,
+                                torch_ucx_coll_request_t** request)
+{
+  ptrdiff_t sbuf = (ptrdiff_t)input_tensor.data_ptr();
+  ptrdiff_t rbuf = (ptrdiff_t)output_tensor.data_ptr();
+
+  size_t data_size = input_tensor.element_size() * input_tensor.numel() / gsize;
+  torch_ucx_coll_request_t* req = new torch_ucx_coll_request_t;;
+
+  if (chunk > gsize || chunk <= 0) {
+    chunk = gsize;
+  }
+  req->grank = grank;
+  req->gsize = gsize;
+  req->chunk = chunk;
+  req->len = data_size;
+  req->src_buffer = (void*)sbuf;
+  req->src_mtype = ucs_mtype_map.at(input_tensor.device().type());
+  req->dst_buffer = (void*)rbuf;
+  req->dst_mtype = ucs_mtype_map.at(output_tensor.device().type());
+  req->tag = tag;
+  req->eps = eps;
+  req->reqs = new ucc_coll_req_h[2 * chunk];
+  req->status = UCC_INPROGRESS;
+  req->comm = comm;
+
+  for (int step = 0; step < chunk; step++) {
+    ucp_tag_t ucp_tag, ucp_tag_mask;
+    int peer;
+
+    peer = get_recv_peer(grank, gsize, step);
+    TORCH_UCX_MAKE_RECV_TAG(ucp_tag, ucp_tag_mask, tag, peer, COMMCOLLID);
+    req->reqs[step] = comm->recv_nb(
+        (void*)(rbuf + peer * data_size),
+        req->dst_mtype,
+        data_size,
+        ucp_tag,
+        ucp_tag_mask);
+
+    peer = get_send_peer(grank, gsize, step);
+    TORCH_UCX_MAKE_SEND_TAG(ucp_tag, tag, grank, COMMCOLLID);
+    req->reqs[step + chunk] = comm->send_nb(
+        eps[peer],
+        (void*)(sbuf + peer * data_size),
+        req->src_mtype,
+        data_size,
+        ucp_tag);
+  }
+  req->n_rreqs = chunk;
+  req->n_sreqs = chunk;
+
+  *request = req;
+  return UCC_OK;
+}
+
 void CommPG::progress_loop() {
   std::unique_lock<std::mutex> lock(mutex);
 #ifdef USE_CUDA
@@ -457,6 +655,9 @@ void CommPG::progress_loop() {
 #endif
     while (work->request_->status > 0) {
       // operation initialized is in progress or
+      if (work->iscoll) {
+        torch_ucx_alltoall_progress((torch_ucx_coll_request_t*)work->request_);
+      }
       work->comm_->progress();
     }
     work->finalize();
@@ -621,6 +822,13 @@ c10::intrusive_ptr<ProcessGroup::Work> ProcessGroupUCC::alltoall_base(
   AlltoallWorkData* data;
 
   if ((outputSplitSizes.size() == 0) && (inputSplitSizes.size() == 0)) {
+    if (std::getenv("USE_UCX_A2A") != nullptr) {
+      torch_ucx_coll_request_t *request;
+      tag++;
+      torch_ucx_alltoall(size_, rank_, tag, inputTensor, outputTensor, torch_ucc_config.chunk,
+                        comm, eps, &request);
+      return comm->enqueue_p2p_coll(OpType::ALLTOALL_BASE, (ucc_coll_req_h)request);
+    }
     data = new AlltoallWorkData(0);
     TORCH_CHECK(
         (outputTensor.size(0) % size_ == 0) &&
@@ -805,6 +1013,7 @@ void ProcessGroupUCC::initComm(c10::Device dev) {
     comm = CommPG::get_comm(comm_id, dev, &oob);
     comm->ucx_connect_eps(eps, &oob);
     comm->ucc_create_team(team, &oob);
+    tag = 0;
   } else {
     if (dev.is_cuda()) {
       if ((comm->cuda_device_index != TORCH_UCC_DEVICE_NOT_SET) &&
